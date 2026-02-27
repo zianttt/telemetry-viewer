@@ -468,7 +468,7 @@ def main() -> None:
             saved.get("frame_step"), 1, 30, 1
         )
         st.session_state["cfg_max_points_per_trace"] = valid_int(
-            saved.get("max_points_per_trace"), 500, 200_000, 6_000
+            saved.get("max_points_per_trace"), 500, 1_000_000, 200_000
         )
 
     data_dir = st.sidebar.text_input("Data directory", key="cfg_data_dir")
@@ -550,7 +550,7 @@ def main() -> None:
         st.session_state.get("cfg_frame_step"), 1, 30, 1
     )
     st.session_state["cfg_max_points_per_trace"] = valid_int(
-        st.session_state.get("cfg_max_points_per_trace"), 500, 200_000, 6_000
+        st.session_state.get("cfg_max_points_per_trace"), 500, 1_000_000, 200_000
     )
 
     rolling_enabled = st.sidebar.checkbox(
