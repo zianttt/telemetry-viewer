@@ -10,9 +10,8 @@ from pathlib import Path
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
+from constants import COMBINE_PAIRS
 from plotly.subplots import make_subplots
-
-from constants import COMBINE_PAIRS, DAIKIN_OUTDOOR_COMMON_COLS
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -33,7 +32,6 @@ EXCLUDED_SENSOR_COLUMNS = {
 }
 ROLLING_METHODS = ["mean", "median", "min", "max"]
 WINDOW_UNITS = ["minutes", "hours"]
-DAIKIN_SCHEMA_MATCH_THRESHOLD = 8
 
 
 def load_persisted_config() -> dict[str, object]:
@@ -173,9 +171,6 @@ def standardize_schema_map(schema_map: dict[str, str]) -> dict[str, str]:
         elif col1 in out:
             out[new_col] = out.pop(col1)
 
-    keep_cols = [col for col in DAIKIN_OUTDOOR_COMMON_COLS if col in out]
-    if len(keep_cols) >= DAIKIN_SCHEMA_MATCH_THRESHOLD:
-        return {col: out[col] for col in keep_cols}
     return out
 
 
@@ -248,11 +243,6 @@ def standardize_lazy_frame(lf: pl.LazyFrame) -> pl.LazyFrame:
     if rename_map:
         out = out.rename(rename_map)
 
-    keep_cols = [
-        col for col in DAIKIN_OUTDOOR_COMMON_COLS if col in out.collect_schema().names()
-    ]
-    if len(keep_cols) >= DAIKIN_SCHEMA_MATCH_THRESHOLD:
-        return out.select(keep_cols)
     return out
 
 
