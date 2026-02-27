@@ -1,12 +1,11 @@
 # Telemetry Viewer
 
-Interactive Streamlit app for inspecting outdoor unit telemetry from `data/outdoor`.
-The chart layer uses Plotly for interactive zoom/pan/hover.
+Interactive Streamlit app for inspecting telemetry.
 
 ## Run
 
 ```bash
-uv run streamlit run tools/telemetry_viewer.py
+uv run streamlit run telemetry_viewer.py
 ```
 
 ## Features
