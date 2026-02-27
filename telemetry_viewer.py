@@ -10,8 +10,9 @@ from pathlib import Path
 import plotly.graph_objects as go
 import polars as pl
 import streamlit as st
-from constants import COMBINE_PAIRS
 from plotly.subplots import make_subplots
+
+from constants import COMBINE_PAIRS
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = Path(__file__).resolve().parent
@@ -284,7 +285,9 @@ def load_unit_frame(csv_path: str, selected_sensors: tuple[str, ...]) -> pl.Data
     if "Error Code" not in cols:
         lf = lf.with_columns(pl.lit("OK").alias("Error Code"))
     else:
-        lf = lf.with_columns(pl.col("Error Code").cast(pl.Utf8, strict=False).alias("Error Code"))
+        lf = lf.with_columns(
+            pl.col("Error Code").cast(pl.Utf8, strict=False).alias("Error Code")
+        )
 
     required_out = ["_dt", "Error Code", *selected_sensors]
     available_out = [c for c in required_out if c in lf.collect_schema().names()]
@@ -331,15 +334,23 @@ def aggregate_time_bucket(
 
     for sensor in sensors:
         if agg_method == "mean":
-            agg_exprs.append(pl.col(sensor).cast(pl.Float64, strict=False).mean().alias(sensor))
+            agg_exprs.append(
+                pl.col(sensor).cast(pl.Float64, strict=False).mean().alias(sensor)
+            )
         else:
-            agg_exprs.append(pl.col(sensor).cast(pl.Float64, strict=False).median().alias(sensor))
+            agg_exprs.append(
+                pl.col(sensor).cast(pl.Float64, strict=False).median().alias(sensor)
+            )
 
         if include_envelope:
             min_col = f"{sensor} [bucket min]"
             max_col = f"{sensor} [bucket max]"
-            agg_exprs.append(pl.col(sensor).cast(pl.Float64, strict=False).min().alias(min_col))
-            agg_exprs.append(pl.col(sensor).cast(pl.Float64, strict=False).max().alias(max_col))
+            agg_exprs.append(
+                pl.col(sensor).cast(pl.Float64, strict=False).min().alias(min_col)
+            )
+            agg_exprs.append(
+                pl.col(sensor).cast(pl.Float64, strict=False).max().alias(max_col)
+            )
             envelope_pairs[sensor] = (min_col, max_col)
 
     out = (
@@ -403,33 +414,52 @@ def error_event_frame(df: pl.DataFrame, code_col: str = "Error Code") -> pl.Data
     ).select(["_dt", code_col])
 
 
-def max_error_code_parts(df: pl.DataFrame) -> int:
+def list_error_code_options(df: pl.DataFrame) -> list[str]:
     if "Error Code" not in df.columns:
-        return 1
-    n_parts = df.select(
-        pl.col("Error Code")
-        .cast(pl.Utf8, strict=False)
-        .fill_null("OK")
-        .str.split("|")
-        .list.len()
-        .max()
-    ).item()
-    if n_parts is None:
-        return 1
-    return max(1, int(n_parts))
+        return []
+    codes = (
+        df.select(
+            pl.col("Error Code")
+            .cast(pl.Utf8, strict=False)
+            .fill_null("OK")
+            .str.split("|")
+            .list.eval(pl.element().str.strip_chars())
+            .alias("_code_parts")
+        )
+        .explode("_code_parts")
+        .filter(
+            pl.col("_code_parts").is_not_null()
+            & (pl.col("_code_parts") != "")
+            & (pl.col("_code_parts") != "OK")
+        )
+        .select(pl.col("_code_parts").alias("code"))
+        .unique()
+        .sort("code")
+    )
+    if codes.height == 0:
+        return []
+    return [str(x) for x in codes.get_column("code").to_list()]
 
 
-def apply_error_code_view(df: pl.DataFrame, view: str) -> pl.DataFrame:
-    if view == "Raw":
-        return df
-    try:
-        part_idx = int(view.split(" ")[1]) - 1
-    except (IndexError, ValueError):
-        return df
+def apply_error_code_selection(
+    df: pl.DataFrame, selected_codes: list[str]
+) -> pl.DataFrame:
+    if "Error Code" not in df.columns:
+        return df.with_columns(pl.lit("OK").alias("Error Code"))
+    if not selected_codes:
+        return df.with_columns(pl.lit("OK").alias("Error Code"))
 
+    selected = [str(code) for code in selected_codes]
     raw = pl.col("Error Code").cast(pl.Utf8, strict=False).fill_null("OK")
-    selected = raw.str.split("|").list.get(part_idx, null_on_oob=True).str.strip_chars()
-    return df.with_columns(pl.coalesce([selected, raw]).alias("Error Code"))
+    parts = raw.str.split("|").list.eval(pl.element().str.strip_chars())
+    matched = (
+        parts.list.eval(
+            pl.when(pl.element().is_in(selected)).then(pl.element()).otherwise(None)
+        )
+        .list.drop_nulls()
+        .list.get(0, null_on_oob=True)
+    )
+    return df.with_columns(pl.coalesce([matched, pl.lit("OK")]).alias("Error Code"))
 
 
 def build_plot(
@@ -441,7 +471,10 @@ def build_plot(
 ) -> go.Figure:
     envelope_pairs = envelope_pairs or {}
     envelope_cols = [
-        col_name for pair in envelope_pairs.values() for col_name in pair if col_name in df.columns
+        col_name
+        for pair in envelope_pairs.values()
+        for col_name in pair
+        if col_name in df.columns
     ]
     plot_df = df.select(["_dt", *sensors, *envelope_cols])
     if normalize:
@@ -560,8 +593,12 @@ def main() -> None:
         st.session_state["cfg_bucket_agg_method"] = str(
             saved.get("bucket_agg_method", BUCKET_AGG_METHODS[0])
         )
-        st.session_state["cfg_bucket_size"] = valid_int(saved.get("bucket_size"), 1, 24 * 60, 5)
-        st.session_state["cfg_bucket_unit"] = str(saved.get("bucket_unit", BUCKET_UNITS[0]))
+        st.session_state["cfg_bucket_size"] = valid_int(
+            saved.get("bucket_size"), 1, 24 * 60, 5
+        )
+        st.session_state["cfg_bucket_unit"] = str(
+            saved.get("bucket_unit", BUCKET_UNITS[0])
+        )
         st.session_state["cfg_show_minmax_envelope"] = bool(
             saved.get("show_minmax_envelope", True)
         )
@@ -571,8 +608,8 @@ def main() -> None:
         st.session_state["cfg_window_unit"] = str(
             saved.get("window_unit", WINDOW_UNITS[0])
         )
-        st.session_state["cfg_error_code_view"] = str(
-            saved.get("error_code_view", "Raw")
+        st.session_state["cfg_selected_error_codes"] = saved.get(
+            "selected_error_codes", []
         )
         st.session_state["cfg_normalize"] = bool(saved.get("normalize", False))
         st.session_state["cfg_frame_step"] = valid_int(
@@ -594,9 +631,7 @@ def main() -> None:
         csv_files = list_csv_files(data_dir)
         root_dir = Path(data_dir)
         if not csv_files:
-            st.error(
-                f"No CSV files found under `{data_dir}`."
-            )
+            st.error(f"No CSV files found under `{data_dir}`.")
             return
         labels = [csv_label(p, root_dir) for p in csv_files]
         st.session_state["cfg_data_file"] = valid_option(
@@ -638,7 +673,9 @@ def main() -> None:
         st.session_state.get("cfg_rolling_method"), ROLLING_METHODS, ROLLING_METHODS[0]
     )
     st.session_state["cfg_downsample_mode"] = valid_option(
-        st.session_state.get("cfg_downsample_mode"), DOWNSAMPLE_MODES, DOWNSAMPLE_MODES[0]
+        st.session_state.get("cfg_downsample_mode"),
+        DOWNSAMPLE_MODES,
+        DOWNSAMPLE_MODES[0],
     )
     st.session_state["cfg_bucket_agg_method"] = valid_option(
         st.session_state.get("cfg_bucket_agg_method"),
@@ -747,27 +784,18 @@ def main() -> None:
         return
 
     df = load_unit_frame(unit_path, tuple(selected_sensors))
-    error_part_count = max_error_code_parts(df)
-    error_code_view_options = (
-        ["Raw"] + [f"Part {i}" for i in range(1, error_part_count + 1)]
-        if error_part_count > 1
-        else ["Raw"]
+    error_code_options = list_error_code_options(df)
+    st.session_state["cfg_selected_error_codes"] = valid_multiselect(
+        st.session_state.get("cfg_selected_error_codes"),
+        error_code_options,
+        [],
     )
-    st.session_state["cfg_error_code_view"] = valid_option(
-        st.session_state.get("cfg_error_code_view"),
-        error_code_view_options,
-        error_code_view_options[0],
+    selected_error_codes = st.sidebar.multiselect(
+        "Target error codes",
+        options=error_code_options,
+        key="cfg_selected_error_codes",
     )
-    if error_part_count > 1:
-        error_code_view = st.sidebar.selectbox(
-            "Error code view",
-            options=error_code_view_options,
-            key="cfg_error_code_view",
-        )
-    else:
-        error_code_view = "Raw"
-        st.session_state["cfg_error_code_view"] = "Raw"
-    df = apply_error_code_view(df, error_code_view)
+    df = apply_error_code_selection(df, selected_error_codes)
 
     save_persisted_config(
         {
@@ -783,7 +811,7 @@ def main() -> None:
             "show_minmax_envelope": show_minmax_envelope,
             "window_size": int(rolling_cfg.window_size),
             "window_unit": rolling_cfg.window_unit,
-            "error_code_view": st.session_state.get("cfg_error_code_view", "Raw"),
+            "selected_error_codes": selected_error_codes,
             "normalize": normalize,
             "frame_step": int(frame_step),
             "max_points_per_trace": int(max_points_per_trace),
@@ -817,7 +845,9 @@ def main() -> None:
         )
 
     errors = error_event_frame(df)
-    plotted_df, plotted_cols = apply_rolling(base_for_plot, selected_sensors, rolling_cfg)
+    plotted_df, plotted_cols = apply_rolling(
+        base_for_plot, selected_sensors, rolling_cfg
+    )
     if rolling_cfg.enabled and envelope_pairs:
         st.caption("Min/max envelope is hidden when rolling telemetry is enabled.")
         envelope_pairs = {}
