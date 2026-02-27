@@ -368,9 +368,10 @@ def error_event_frame(df: pl.DataFrame, code_col: str = "Error Code") -> pl.Data
 def build_plot(
     df: pl.DataFrame,
     sensors: list[str],
+    errors: pl.DataFrame,
     show_error_overlay: bool,
     normalize: bool,
-) -> tuple[go.Figure, pl.DataFrame]:
+) -> go.Figure:
     plot_df = df.select(["_dt", "Error Code", *sensors])
     if normalize:
         plot_df = normalize_columns(plot_df, sensors)
@@ -397,18 +398,7 @@ def build_plot(
             col=1,
         )
 
-    errors = error_event_frame(df)
-    if errors.height == 0 or not show_error_overlay:
-        fig.add_annotation(
-            text="No non-OK error events in selected range",
-            xref="paper",
-            yref="paper",
-            x=0.01,
-            y=0.08,
-            showarrow=False,
-            font={"size": 12},
-        )
-    else:
+    if show_error_overlay and errors.height > 0:
         err_times = errors.get_column("_dt").to_list()
         err_codes = errors.get_column("Error Code").to_list()
         fig.add_trace(
@@ -441,7 +431,7 @@ def build_plot(
     )
     fig.update_yaxes(title_text="Error", type="category", row=2, col=1)
     fig.update_xaxes(title_text="Time", row=2, col=1)
-    return fig, errors
+    return fig
 
 
 def main() -> None:
@@ -647,6 +637,7 @@ def main() -> None:
     else:
         filtered = df
 
+    errors = error_event_frame(filtered)
     plotted_df, plotted_cols = apply_rolling(filtered, selected_sensors, rolling_cfg)
     plotted_df, auto_step = decimate_rows(plotted_df, int(max_points_per_trace))
     if auto_step > 1:
@@ -654,7 +645,11 @@ def main() -> None:
             f"Adaptive decimation applied: keeping ~1/{auto_step} rows "
             f"({plotted_df.height:,} plotted points per trace max)."
         )
-    fig, errors = build_plot(plotted_df, plotted_cols, show_errors, normalize)
+    if not show_errors:
+        st.caption("Error overlay is disabled. Enable `Show error code overlay` to display error markers.")
+    elif errors.height == 0:
+        st.caption("No non-OK error events in selected range.")
+    fig = build_plot(plotted_df, plotted_cols, errors, show_errors, normalize)
     st.plotly_chart(fig, width="stretch")
 
     c1, c2 = st.columns(2)
