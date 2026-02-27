@@ -585,7 +585,6 @@ def main() -> None:
     max_points_per_trace = st.sidebar.number_input(
         "Max points per trace",
         min_value=500,
-        max_value=200_000,
         step=500,
         key="cfg_max_points_per_trace",
     )
