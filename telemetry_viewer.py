@@ -272,6 +272,8 @@ def load_unit_frame(csv_path: str, selected_sensors: tuple[str, ...]) -> pl.Data
 
     if "Error Code" not in cols:
         lf = lf.with_columns(pl.lit("OK").alias("Error Code"))
+    else:
+        lf = lf.with_columns(pl.col("Error Code").cast(pl.Utf8, strict=False).alias("Error Code"))
 
     required_out = ["_dt", "Error Code", *selected_sensors]
     available_out = [c for c in required_out if c in lf.collect_schema().names()]
