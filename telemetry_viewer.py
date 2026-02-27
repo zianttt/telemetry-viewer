@@ -32,6 +32,9 @@ EXCLUDED_SENSOR_COLUMNS = {
 }
 ROLLING_METHODS = ["mean", "median", "min", "max"]
 WINDOW_UNITS = ["minutes", "hours"]
+DOWNSAMPLE_MODES = ["skip", "time-bucket"]
+BUCKET_AGG_METHODS = ["mean", "median"]
+BUCKET_UNITS = ["minutes", "hours"]
 
 
 def load_persisted_config() -> dict[str, object]:
@@ -144,13 +147,21 @@ def parse_error_markdown(path: Path) -> dict[str, str]:
 
 
 @st.cache_data(show_spinner=False)
-def list_unit_files(data_dir: str) -> dict[str, list[Path]]:
+def list_csv_files(data_dir: str) -> list[Path]:
     root = Path(data_dir)
-    files = sorted(root.glob("*/*.csv"))
-    by_site: dict[str, list[Path]] = {}
-    for file in files:
-        by_site.setdefault(file.parent.name, []).append(file)
-    return by_site
+    if not root.exists() or not root.is_dir():
+        return []
+    return sorted(root.rglob("*.csv"))
+
+
+def csv_label(path: Path, root_dir: Path) -> str:
+    try:
+        rel = path.relative_to(root_dir)
+    except ValueError:
+        rel = path
+    if rel.parent == Path("."):
+        return path.stem
+    return f"{rel.parent.as_posix()}/{path.stem}"
 
 
 @st.cache_data(show_spinner=False)
@@ -306,6 +317,41 @@ def decimate_rows(
     return out, step
 
 
+def aggregate_time_bucket(
+    df: pl.DataFrame,
+    sensors: list[str],
+    bucket_size: int,
+    bucket_unit: str,
+    agg_method: str,
+    include_envelope: bool,
+) -> tuple[pl.DataFrame, dict[str, tuple[str, str]]]:
+    every = f"{bucket_size}{'m' if bucket_unit == 'minutes' else 'h'}"
+    agg_exprs: list[pl.Expr] = []
+    envelope_pairs: dict[str, tuple[str, str]] = {}
+
+    for sensor in sensors:
+        if agg_method == "mean":
+            agg_exprs.append(pl.col(sensor).cast(pl.Float64, strict=False).mean().alias(sensor))
+        else:
+            agg_exprs.append(pl.col(sensor).cast(pl.Float64, strict=False).median().alias(sensor))
+
+        if include_envelope:
+            min_col = f"{sensor} [bucket min]"
+            max_col = f"{sensor} [bucket max]"
+            agg_exprs.append(pl.col(sensor).cast(pl.Float64, strict=False).min().alias(min_col))
+            agg_exprs.append(pl.col(sensor).cast(pl.Float64, strict=False).max().alias(max_col))
+            envelope_pairs[sensor] = (min_col, max_col)
+
+    out = (
+        df.lazy()
+        .group_by_dynamic(index_column="_dt", every=every, closed="left", label="left")
+        .agg(agg_exprs)
+        .sort("_dt")
+        .collect()
+    )
+    return out, envelope_pairs
+
+
 def apply_rolling(
     df: pl.DataFrame, sensors: list[str], cfg: RollingConfig
 ) -> tuple[pl.DataFrame, list[str]]:
@@ -357,15 +403,49 @@ def error_event_frame(df: pl.DataFrame, code_col: str = "Error Code") -> pl.Data
     ).select(["_dt", code_col])
 
 
+def max_error_code_parts(df: pl.DataFrame) -> int:
+    if "Error Code" not in df.columns:
+        return 1
+    n_parts = df.select(
+        pl.col("Error Code")
+        .cast(pl.Utf8, strict=False)
+        .fill_null("OK")
+        .str.split("|")
+        .list.len()
+        .max()
+    ).item()
+    if n_parts is None:
+        return 1
+    return max(1, int(n_parts))
+
+
+def apply_error_code_view(df: pl.DataFrame, view: str) -> pl.DataFrame:
+    if view == "Raw":
+        return df
+    try:
+        part_idx = int(view.split(" ")[1]) - 1
+    except (IndexError, ValueError):
+        return df
+
+    raw = pl.col("Error Code").cast(pl.Utf8, strict=False).fill_null("OK")
+    selected = raw.str.split("|").list.get(part_idx, null_on_oob=True).str.strip_chars()
+    return df.with_columns(pl.coalesce([selected, raw]).alias("Error Code"))
+
+
 def build_plot(
     df: pl.DataFrame,
     sensors: list[str],
     errors: pl.DataFrame,
     normalize: bool,
+    envelope_pairs: dict[str, tuple[str, str]] | None = None,
 ) -> go.Figure:
-    plot_df = df.select(["_dt", "Error Code", *sensors])
+    envelope_pairs = envelope_pairs or {}
+    envelope_cols = [
+        col_name for pair in envelope_pairs.values() for col_name in pair if col_name in df.columns
+    ]
+    plot_df = df.select(["_dt", *sensors, *envelope_cols])
     if normalize:
-        plot_df = normalize_columns(plot_df, sensors)
+        plot_df = normalize_columns(plot_df, [*sensors, *envelope_cols])
 
     fig = make_subplots(
         rows=2,
@@ -376,6 +456,36 @@ def build_plot(
     )
     x = plot_df.get_column("_dt").to_list()
     for sensor in sensors:
+        min_col, max_col = envelope_pairs.get(sensor, ("", ""))
+        if min_col in plot_df.columns and max_col in plot_df.columns:
+            y_min = plot_df.get_column(min_col).to_numpy()
+            y_max = plot_df.get_column(max_col).to_numpy()
+            fig.add_trace(
+                go.Scattergl(
+                    x=x,
+                    y=y_min,
+                    mode="lines",
+                    line={"width": 0},
+                    showlegend=False,
+                    hoverinfo="skip",
+                ),
+                row=1,
+                col=1,
+            )
+            fig.add_trace(
+                go.Scattergl(
+                    x=x,
+                    y=y_max,
+                    mode="lines",
+                    line={"width": 0},
+                    fill="tonexty",
+                    fillcolor="rgba(120,120,120,0.12)",
+                    name=f"{sensor} min/max",
+                    hoverinfo="skip",
+                ),
+                row=1,
+                col=1,
+            )
         y = plot_df.get_column(sensor).to_numpy()
         fig.add_trace(
             go.Scattergl(
@@ -436,12 +546,7 @@ def main() -> None:
         st.session_state["cfg_data_dir"] = str(
             saved.get("data_dir", str(DEFAULT_DATA_DIR))
         )
-        st.session_state["cfg_error_doc"] = str(
-            saved.get("error_doc", str(DEFAULT_ERROR_DOC))
-        )
-        st.session_state["cfg_csv_path"] = str(saved.get("csv_path", ""))
-        st.session_state["cfg_site"] = saved.get("site")
-        st.session_state["cfg_unit"] = saved.get("unit")
+        st.session_state["cfg_data_file"] = str(saved.get("data_file", ""))
         st.session_state["cfg_selected_sensors"] = saved.get("selected_sensors", [])
         st.session_state["cfg_rolling_enabled"] = bool(
             saved.get("rolling_enabled", False)
@@ -449,11 +554,25 @@ def main() -> None:
         st.session_state["cfg_rolling_method"] = str(
             saved.get("rolling_method", ROLLING_METHODS[0])
         )
+        st.session_state["cfg_downsample_mode"] = str(
+            saved.get("downsample_mode", DOWNSAMPLE_MODES[0])
+        )
+        st.session_state["cfg_bucket_agg_method"] = str(
+            saved.get("bucket_agg_method", BUCKET_AGG_METHODS[0])
+        )
+        st.session_state["cfg_bucket_size"] = valid_int(saved.get("bucket_size"), 1, 24 * 60, 5)
+        st.session_state["cfg_bucket_unit"] = str(saved.get("bucket_unit", BUCKET_UNITS[0]))
+        st.session_state["cfg_show_minmax_envelope"] = bool(
+            saved.get("show_minmax_envelope", True)
+        )
         st.session_state["cfg_window_size"] = valid_int(
             saved.get("window_size"), 1, 24 * 60, 60
         )
         st.session_state["cfg_window_unit"] = str(
             saved.get("window_unit", WINDOW_UNITS[0])
+        )
+        st.session_state["cfg_error_code_view"] = str(
+            saved.get("error_code_view", "Raw")
         )
         st.session_state["cfg_normalize"] = bool(saved.get("normalize", False))
         st.session_state["cfg_frame_step"] = valid_int(
@@ -464,8 +583,6 @@ def main() -> None:
         )
 
     data_dir = st.sidebar.text_input("Data directory", key="cfg_data_dir")
-    error_doc = st.sidebar.text_input("Error doc path", key="cfg_error_doc")
-    csv_path_input = st.sidebar.text_input("CSV path (optional)", key="cfg_csv_path")
     uploaded_csv = st.sidebar.file_uploader("Upload CSV (optional)", type=["csv"])
     uploaded_csv_path = persist_uploaded_csv(uploaded_csv)
 
@@ -473,39 +590,27 @@ def main() -> None:
     if uploaded_csv_path:
         unit_path = uploaded_csv_path
         source_label = f"Uploaded: {Path(uploaded_csv_path).name}"
-    elif csv_path_input.strip():
-        candidate = Path(csv_path_input).expanduser()
-        if not candidate.exists() or not candidate.is_file():
-            st.error(f"CSV path does not exist or is not a file: `{candidate}`")
-            return
-        if candidate.suffix.lower() != ".csv":
-            st.error(f"CSV path is not a .csv file: `{candidate}`")
-            return
-        unit_path = str(candidate.resolve())
-        source_label = f"Path: {candidate.name}"
     else:
-        site_map = list_unit_files(data_dir)
-        if not site_map:
+        csv_files = list_csv_files(data_dir)
+        root_dir = Path(data_dir)
+        if not csv_files:
             st.error(
-                f"No CSV files found in {data_dir}. Expected layout: data/outdoor/<site>/<unit>.csv"
+                f"No CSV files found under `{data_dir}`."
             )
             return
-
-        sites = sorted(site_map.keys())
-        st.session_state["cfg_site"] = valid_option(
-            st.session_state.get("cfg_site"), sites, sites[0]
+        labels = [csv_label(p, root_dir) for p in csv_files]
+        st.session_state["cfg_data_file"] = valid_option(
+            st.session_state.get("cfg_data_file"), labels, labels[0]
         )
-        site = st.sidebar.selectbox("Site", options=sites, key="cfg_site")
-        unit_paths = site_map[site]
-        unit_labels = [p.stem for p in unit_paths]
-        st.session_state["cfg_unit"] = valid_option(
-            st.session_state.get("cfg_unit"), unit_labels, unit_labels[0]
+        selected_label = st.sidebar.selectbox(
+            "CSV file",
+            options=labels,
+            key="cfg_data_file",
         )
-        selected_unit = st.sidebar.selectbox(
-            "Unit", options=unit_labels, key="cfg_unit"
-        )
-        unit_path = str(unit_paths[unit_labels.index(selected_unit)])
-        source_label = f"{site}/{selected_unit}"
+        selected_idx = labels.index(selected_label)
+        selected_path = csv_files[selected_idx]
+        unit_path = str(selected_path.resolve())
+        source_label = selected_label
 
     raw_schema = raw_schema_map(unit_path)
     is_valid, validation_msg = validate_csv_schema(raw_schema)
@@ -531,6 +636,20 @@ def main() -> None:
 
     st.session_state["cfg_rolling_method"] = valid_option(
         st.session_state.get("cfg_rolling_method"), ROLLING_METHODS, ROLLING_METHODS[0]
+    )
+    st.session_state["cfg_downsample_mode"] = valid_option(
+        st.session_state.get("cfg_downsample_mode"), DOWNSAMPLE_MODES, DOWNSAMPLE_MODES[0]
+    )
+    st.session_state["cfg_bucket_agg_method"] = valid_option(
+        st.session_state.get("cfg_bucket_agg_method"),
+        BUCKET_AGG_METHODS,
+        BUCKET_AGG_METHODS[0],
+    )
+    st.session_state["cfg_bucket_size"] = valid_int(
+        st.session_state.get("cfg_bucket_size"), 1, 24 * 60, 5
+    )
+    st.session_state["cfg_bucket_unit"] = valid_option(
+        st.session_state.get("cfg_bucket_unit"), BUCKET_UNITS, BUCKET_UNITS[0]
     )
     st.session_state["cfg_window_size"] = valid_int(
         st.session_state.get("cfg_window_size"), 1, 24 * 60, 60
@@ -567,13 +686,6 @@ def main() -> None:
         key="cfg_window_unit",
     )
     normalize = st.sidebar.checkbox("Normalize sensors (z-score)", key="cfg_normalize")
-    frame_step = st.sidebar.slider(
-        "Downsample every N rows",
-        min_value=1,
-        max_value=30,
-        step=1,
-        key="cfg_frame_step",
-    )
     max_points_per_trace = st.sidebar.number_input(
         "Max points per trace",
         min_value=500,
@@ -587,45 +699,128 @@ def main() -> None:
         window_size=int(window_size),
         window_unit=window_unit,
     )
-
-    save_persisted_config(
-        {
-            "data_dir": data_dir,
-            "error_doc": error_doc,
-            "csv_path": csv_path_input,
-            "site": st.session_state.get("cfg_site"),
-            "unit": st.session_state.get("cfg_unit"),
-            "selected_sensors": selected_sensors,
-            "rolling_enabled": rolling_cfg.enabled,
-            "rolling_method": rolling_cfg.method,
-            "window_size": int(rolling_cfg.window_size),
-            "window_unit": rolling_cfg.window_unit,
-            "normalize": normalize,
-            "frame_step": int(frame_step),
-            "max_points_per_trace": int(max_points_per_trace),
-        }
+    downsample_mode = st.sidebar.selectbox(
+        "Downsample mode",
+        options=DOWNSAMPLE_MODES,
+        key="cfg_downsample_mode",
     )
+
+    if downsample_mode == "skip":
+        frame_step = st.sidebar.slider(
+            "Downsample every N rows",
+            min_value=1,
+            max_value=30,
+            step=1,
+            key="cfg_frame_step",
+        )
+        bucket_agg_method = st.session_state["cfg_bucket_agg_method"]
+        bucket_size = int(st.session_state["cfg_bucket_size"])
+        bucket_unit = st.session_state["cfg_bucket_unit"]
+        show_minmax_envelope = bool(st.session_state["cfg_show_minmax_envelope"])
+    else:
+        bucket_agg_method = st.sidebar.selectbox(
+            "Bucket aggregate",
+            options=BUCKET_AGG_METHODS,
+            key="cfg_bucket_agg_method",
+        )
+        bucket_size = st.sidebar.number_input(
+            "Bucket size",
+            min_value=1,
+            max_value=24 * 60,
+            step=1,
+            key="cfg_bucket_size",
+        )
+        bucket_unit = st.sidebar.radio(
+            "Bucket unit",
+            options=BUCKET_UNITS,
+            horizontal=True,
+            key="cfg_bucket_unit",
+        )
+        show_minmax_envelope = st.sidebar.checkbox(
+            "Show min/max envelope",
+            key="cfg_show_minmax_envelope",
+        )
+        frame_step = int(st.session_state["cfg_frame_step"])
 
     if not selected_sensors:
         st.info("Pick at least one sensor.")
         return
 
     df = load_unit_frame(unit_path, tuple(selected_sensors))
+    error_part_count = max_error_code_parts(df)
+    error_code_view_options = (
+        ["Raw"] + [f"Part {i}" for i in range(1, error_part_count + 1)]
+        if error_part_count > 1
+        else ["Raw"]
+    )
+    st.session_state["cfg_error_code_view"] = valid_option(
+        st.session_state.get("cfg_error_code_view"),
+        error_code_view_options,
+        error_code_view_options[0],
+    )
+    if error_part_count > 1:
+        error_code_view = st.sidebar.selectbox(
+            "Error code view",
+            options=error_code_view_options,
+            key="cfg_error_code_view",
+        )
+    else:
+        error_code_view = "Raw"
+        st.session_state["cfg_error_code_view"] = "Raw"
+    df = apply_error_code_view(df, error_code_view)
+
+    save_persisted_config(
+        {
+            "data_dir": data_dir,
+            "data_file": st.session_state.get("cfg_data_file"),
+            "selected_sensors": selected_sensors,
+            "rolling_enabled": rolling_cfg.enabled,
+            "rolling_method": rolling_cfg.method,
+            "downsample_mode": downsample_mode,
+            "bucket_agg_method": bucket_agg_method,
+            "bucket_size": int(bucket_size),
+            "bucket_unit": bucket_unit,
+            "show_minmax_envelope": show_minmax_envelope,
+            "window_size": int(rolling_cfg.window_size),
+            "window_unit": rolling_cfg.window_unit,
+            "error_code_view": st.session_state.get("cfg_error_code_view", "Raw"),
+            "normalize": normalize,
+            "frame_step": int(frame_step),
+            "max_points_per_trace": int(max_points_per_trace),
+        }
+    )
+
     min_dt = df.select(pl.col("_dt").min()).item()
     max_dt = df.select(pl.col("_dt").max()).item()
     st.sidebar.write(f"Range: `{min_dt}` to `{max_dt}`")
 
-    if frame_step > 1:
-        filtered = (
-            df.with_row_index("__row_idx")
-            .filter((pl.col("__row_idx") % frame_step) == 0)
-            .drop("__row_idx")
-        )
+    if downsample_mode == "skip":
+        if frame_step > 1:
+            filtered = (
+                df.with_row_index("__row_idx")
+                .filter((pl.col("__row_idx") % frame_step) == 0)
+                .drop("__row_idx")
+            )
+        else:
+            filtered = df
+        base_for_plot = filtered
+        envelope_pairs: dict[str, tuple[str, str]] = {}
     else:
         filtered = df
+        base_for_plot, envelope_pairs = aggregate_time_bucket(
+            df=df,
+            sensors=selected_sensors,
+            bucket_size=int(bucket_size),
+            bucket_unit=bucket_unit,
+            agg_method=bucket_agg_method,
+            include_envelope=show_minmax_envelope,
+        )
 
-    errors = error_event_frame(filtered)
-    plotted_df, plotted_cols = apply_rolling(filtered, selected_sensors, rolling_cfg)
+    errors = error_event_frame(df)
+    plotted_df, plotted_cols = apply_rolling(base_for_plot, selected_sensors, rolling_cfg)
+    if rolling_cfg.enabled and envelope_pairs:
+        st.caption("Min/max envelope is hidden when rolling telemetry is enabled.")
+        envelope_pairs = {}
     plotted_df, auto_step = decimate_rows(plotted_df, int(max_points_per_trace))
     if auto_step > 1:
         st.caption(
@@ -634,7 +829,7 @@ def main() -> None:
         )
     if errors.height == 0:
         st.caption("No non-OK error events in selected range.")
-    fig = build_plot(plotted_df, plotted_cols, errors, normalize)
+    fig = build_plot(plotted_df, plotted_cols, errors, normalize, envelope_pairs)
     st.plotly_chart(fig, width="stretch")
 
     c1, c2 = st.columns(2)
@@ -660,7 +855,7 @@ def main() -> None:
             )
             st.dataframe(counts, width="stretch")
 
-            descriptions = parse_error_markdown(Path(error_doc))
+            descriptions = parse_error_markdown(DEFAULT_ERROR_DOC)
             if descriptions:
                 codes = counts.get_column("Error Code").to_list()
                 desc_frame = pl.DataFrame(
